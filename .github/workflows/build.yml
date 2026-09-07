@@ -22,3 +22,4 @@ jobs:
         with:
           name: app-debug
           path: covenant-android-project/app/build/outputs/apk/debug/app-debug.apk
+.
