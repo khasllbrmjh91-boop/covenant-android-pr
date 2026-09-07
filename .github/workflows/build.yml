@@ -1,5 +1,7 @@
 name: Build APK
+
 on: push
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -10,20 +12,18 @@ jobs:
       - name: Unzip project
         run: unzip -o covenant-android-project.zip
 
-      - name: List files (to be sure)
-        run: ls -la
-
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: 18
 
-      - name: Install dependencies and sync (in root folder)
+      - name: Install dependencies and sync
         run: |
+          cd covenant-android-project
           npm install
           npx cap sync android
 
-      - name: Build APK (inside android folder)
+      - name: Build APK
         run: |
           cd covenant-android-project
           chmod +x gradlew
