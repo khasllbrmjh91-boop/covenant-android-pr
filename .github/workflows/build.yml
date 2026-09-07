@@ -1,6 +1,7 @@
 name: Build APK
 
-on: push
+on:
+  push:
 
 jobs:
   build:
@@ -17,10 +18,14 @@ jobs:
         with:
           node-version: 18
 
-      - name: Install dependencies and sync
+      - name: Install dependencies
         run: |
           cd covenant-android-project
           npm install
+
+      - name: Sync Capacitor Android
+        run: |
+          cd covenant-android-project
           npx cap sync android
 
       - name: Build APK
