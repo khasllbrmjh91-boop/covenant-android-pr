@@ -2,118 +2,295 @@ name: Build APK
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       actions: write
 
     steps:
+
+      # ==============================
+      # 1. Checkout
+      # ==============================
       - name: Checkout repository
         uses: actions/checkout@v4
 
+
+      # ==============================
+      # 2. Verify ZIP
+      # ==============================
       - name: Verify zip file exists
         run: |
-          if [ ! -f covenant-android-project.zip ]; then
+          if [ ! -f "covenant-android-project.zip" ]; then
             echo "::error::covenant-android-project.zip not found in repository root"
+            echo "Files in repository:"
+            ls -la
             exit 1
           fi
 
+          echo "ZIP file found:"
+          ls -lh covenant-android-project.zip
+
+
+      # ==============================
+      # 3. Extract project
+      # ==============================
       - name: Extract project zip
+        shell: bash
         run: |
+          set -e
+
           echo "Extracting covenant-android-project.zip..."
-          unzip -q -o covenant-android-project.zip
-          
-          # تحديد المجلد الذي يحتوي على package.json
-          PROJECT_ROOT=$(find . -maxdepth 2 -name "package.json" -not -path "./node_modules/*" -printf '%h\n' | head -1)
-          if [ -z "$PROJECT_ROOT" ]; then
+
+          rm -rf .build-extract
+          rm -rf covenant-android-project
+
+          mkdir -p .build-extract
+          mkdir -p covenant-android-project
+
+          unzip -q -o covenant-android-project.zip -d .build-extract
+
+          echo ""
+          echo "Extracted files:"
+          find .build-extract -maxdepth 3 -type f | head -100
+
+          echo ""
+          echo "Searching for package.json..."
+
+          PACKAGE_JSON=$(find .build-extract \
+            -type f \
+            -name "package.json" \
+            -not -path "*/node_modules/*" \
+            | head -1)
+
+          if [ -z "$PACKAGE_JSON" ]; then
             echo "::error::No package.json found after extraction"
+            echo ""
+            echo "Extracted directory:"
+            find .build-extract -maxdepth 4 -print
             exit 1
           fi
-          
-          echo "Project root detected at: $PROJECT_ROOT"
-          
-          # إذا كان المشروع داخل مجلد فرعي غير covenant-android-project، انقله
-          if [ "$PROJECT_ROOT" != "./covenant-android-project" ]; then
-            # تجنب نقل الملفات من الجذر الحالي
-            if [ "$PROJECT_ROOT" = "." ] || [ "$PROJECT_ROOT" = "./" ]; then
-              echo "Project is already at repository root, moving contents to covenant-android-project/"
-              mkdir -p covenant-android-project
-              # انقل كل شيء ما عدا المجلد الذي ننشئه والملف المضغوط
-              shopt -s extglob
-              mv !(covenant-android-project|covenant-android-project.zip) covenant-android-project/ 2>/dev/null || true
-              shopt -u extglob
-            else
-              echo "Moving $PROJECT_ROOT to ./covenant-android-project"
-              mkdir -p covenant-android-project
-              mv "$PROJECT_ROOT"/* covenant-android-project/ 2>/dev/null || true
-              mv "$PROJECT_ROOT"/.[!.]* covenant-android-project/ 2>/dev/null || true
-              rmdir "$PROJECT_ROOT" 2>/dev/null || true
-            fi
-          fi
 
+          echo "package.json found:"
+          echo "$PACKAGE_JSON"
+
+          # الحصول على مجلد المشروع
+          PROJECT_ROOT=$(dirname "$PACKAGE_JSON")
+
+          echo ""
+          echo "Project root:"
+          echo "$PROJECT_ROOT"
+
+          # نسخ المشروع كاملاً بما فيه الملفات المخفية
+          cp -a "$PROJECT_ROOT"/. covenant-android-project/
+
+          echo ""
+          echo "Final project structure:"
+          find covenant-android-project -maxdepth 2 -type f | head -100
+
+          echo ""
+          echo "Project prepared successfully."
+
+
+      # ==============================
+      # 4. Verify project
+      # ==============================
       - name: Verify project structure
         working-directory: covenant-android-project
+        shell: bash
         run: |
-          test -f package.json || { echo "::error::package.json missing"; exit 1; }
+          set -e
+
+          echo "Checking project structure..."
+
+          if [ ! -f package.json ]; then
+            echo "::error::package.json missing"
+            exit 1
+          fi
+
+          echo "package.json:"
+          ls -lh package.json
+
+          if [ -f package-lock.json ]; then
+            echo "package-lock.json found"
+          else
+            echo "No package-lock.json found"
+          fi
+
+          if [ -f capacitor.config.ts ]; then
+            echo "capacitor.config.ts found"
+          fi
+
+          if [ -f capacitor.config.json ]; then
+            echo "capacitor.config.json found"
+          fi
+
+          if [ -d android ]; then
+            echo "Android directory already exists"
+          else
+            echo "Android directory does not exist yet"
+          fi
+
+          echo ""
           echo "Basic project structure OK"
 
-      - name: Setup Node.js 18
+
+      # ==============================
+      # 5. Setup Node
+      # ==============================
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
-          cache: 'npm'
-          cache-dependency-path: covenant-android-project/package-lock.json
+          node-version: 20
 
+
+      # ==============================
+      # 6. Install dependencies
+      # ==============================
       - name: Install dependencies
         working-directory: covenant-android-project
+        shell: bash
         run: |
+          set -e
+
+          echo "Node version:"
+          node --version
+
+          echo "NPM version:"
+          npm --version
+
+          echo ""
+          echo "Installing dependencies..."
+
           if [ -f package-lock.json ]; then
+            echo "Using npm ci..."
             npm ci --legacy-peer-deps
           else
+            echo "package-lock.json not found."
+            echo "Using npm install..."
             npm install --legacy-peer-deps
           fi
 
+          echo ""
+          echo "Dependencies installed successfully."
+
+
+      # ==============================
+      # 7. Capacitor Android
+      # ==============================
       - name: Sync Capacitor Android
         working-directory: covenant-android-project
+        shell: bash
         run: |
+          set -e
+
+          echo "Checking Capacitor..."
+
+          npx cap --version
+
+          echo ""
+
           if [ ! -d android ]; then
-            echo "Android platform not found, adding it..."
+            echo "Android platform not found."
+            echo "Adding Android platform..."
+
             npx cap add android
           else
-            echo "Android platform exists, syncing..."
+            echo "Android platform already exists."
           fi
+
+          echo ""
+          echo "Syncing Capacitor..."
+
           npx cap sync android
 
+          echo ""
+          echo "Capacitor Android sync completed."
+
+
+      # ==============================
+      # 8. Setup Java 17
+      # ==============================
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
-          cache: 'gradle'
-          cache-dependency-path: covenant-android-project/android/gradle/wrapper/gradle-wrapper.properties
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
 
+
+      # ==============================
+      # 9. Build APK
+      # ==============================
       - name: Build debug APK
         working-directory: covenant-android-project/android
+        shell: bash
         run: |
+          set -e
+
+          echo "Java version:"
+          java -version
+
+          echo ""
+          echo "Gradle version:"
+          ./gradlew --version
+
+          echo ""
+          echo "Building debug APK..."
+
           chmod +x gradlew
+
           ./gradlew clean assembleDebug --stacktrace
 
+          echo ""
+          echo "APK build completed."
+
+
+      # ==============================
+      # 10. Locate APK
+      # ==============================
       - name: Locate APK
         id: apk
+        shell: bash
         run: |
-          APK_PATH=$(find covenant-android-project/android/app/build/outputs/apk/debug -name "*.apk" -type f | head -1)
+          set -e
+
+          echo "Searching for APK..."
+
+          APK_PATH=$(find \
+            covenant-android-project/android/app/build/outputs/apk/debug \
+            -type f \
+            -name "*.apk" \
+            | head -1)
+
           if [ -z "$APK_PATH" ]; then
             echo "::error::APK not found after build"
+
+            echo ""
+            echo "Build output:"
+            find covenant-android-project/android/app/build/outputs \
+              -type f 2>/dev/null || true
+
             exit 1
           fi
-          echo "APK path: $APK_PATH"
-          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
 
+          echo ""
+          echo "APK found:"
+          echo "$APK_PATH"
+
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+
+      # ==============================
+      # 11. Upload APK
+      # ==============================
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -121,11 +298,27 @@ jobs:
           path: ${{ steps.apk.outputs.apk_path }}
           if-no-files-found: error
 
+
+      # ==============================
+      # 12. Build summary
+      # ==============================
       - name: Build summary
         if: always()
+        shell: bash
         run: |
-          if [[ -n "${{ steps.apk.outputs.apk_path }}" && -f "${{ steps.apk.outputs.apk_path }}" ]]; then
-            echo "✅ APK built successfully" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ steps.apk.outputs.apk_path }}" ] &&
+             [ -f "${{ steps.apk.outputs.apk_path }}" ]; then
+
+            echo "## ✅ APK Build Successful" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "APK successfully built." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**APK:** \`${{ steps.apk.outputs.apk_path }}\`" >> "$GITHUB_STEP_SUMMARY"
+
           else
-            echo "❌ APK build failed" >> $GITHUB_STEP_SUMMARY
+
+            echo "## ❌ APK Build Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "The APK was not generated." >> "$GITHUB_STEP_SUMMARY"
+
           fi
