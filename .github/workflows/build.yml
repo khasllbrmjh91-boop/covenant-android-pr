@@ -13,6 +13,7 @@ jobs:
       - run: npx cap sync android
       - name: Build APK
         run: |
+          unzip -o covenant-android-project.zip
           cd covenant-android-project
           chmod +x gradlew
           ./gradlew assembleDebug
