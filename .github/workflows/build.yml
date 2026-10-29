@@ -1,324 +1,861 @@
-name: Build APK
+name: Build Android APK
+
+# ═══════════════════════════════════════════════════════════════════
+# النسخة المعدّلة (v2): لا تعيد كتابة أي ملف Java من الصفر.
+#  - تأخذ ملفات android/…/com/kova/cash من الـ ZIP (بما فيها إصلاحات SMS) وتعيدها فوق مشروع cap add الجديد.
+#  - تنسخ TuaSmsSettingsPlugin.kt وتسجّله في MainActivity قبل super.onCreate().
+#  - لا تلمس MainActivity القادم من الـ ZIP إلا بإضافة ما ينقصه (تسجيل المكوّنات، وجسر الأدمن إن كان غائباً).
+# ═══════════════════════════════════════════════════════════════════
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
+    inputs:
+      zip_file:
+        description: 'اسم ملف ZIP (اختياري). اتركه فارغاً لاختيار أحدث KOVANT*.zip تلقائياً'
+        required: false
+        default: ''
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-      actions: write
-
     steps:
-
-      # ==============================
-      # 1. Checkout
-      # ==============================
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # التاريخ الكامل مطلوب لمعرفة أحدث ملف ZIP حسب وقت الـ commit
+          fetch-depth: 0
 
-
-      # ==============================
-      # 2. Verify ZIP
-      # ==============================
-      - name: Verify zip file exists
+      - name: Find and Unzip Project
+        env:
+          INPUT_ZIP: ${{ github.event.inputs.zip_file }}
         run: |
-          if [ ! -f "covenant-android-project.zip" ]; then
-            echo "::error::covenant-android-project.zip not found in repository root"
-            echo "Files in repository:"
-            ls -la
-            exit 1
-          fi
+          echo "=== البحث عن ملفات ZIP ==="
+          ls -la *.zip 2>/dev/null || echo "لا توجد ملفات ZIP في الجذر"
 
-          echo "ZIP file found:"
-          ls -lh covenant-android-project.zip
+          # يختار الملف الأحدث حسب وقت آخر commit (وليس حسب رقم V في الاسم)
+          pick_latest() {
+            local best="" best_ts=-1 f ts
+            while IFS= read -r f; do
+              ts=$(git log -1 --format=%ct -- "$f" 2>/dev/null || true)
+              ts=${ts:-0}
+              if [ "$ts" -gt "$best_ts" ] || { [ "$ts" -eq "$best_ts" ] && [[ "$f" > "$best" ]]; }; then
+                best="$f"
+                best_ts="$ts"
+              fi
+            done
+            echo "$best"
+          }
 
-
-      # ==============================
-      # 3. Extract project
-      # ==============================
-      - name: Extract project zip
-        shell: bash
-        run: |
-          set -e
-
-          echo "Extracting covenant-android-project.zip..."
-
-          rm -rf .build-extract
-          rm -rf covenant-android-project
-
-          mkdir -p .build-extract
-          mkdir -p covenant-android-project
-
-          unzip -q -o covenant-android-project.zip -d .build-extract
-
-          echo ""
-          echo "Extracted files:"
-          find .build-extract -maxdepth 3 -type f | head -100
-
-          echo ""
-          echo "Searching for package.json..."
-
-          PACKAGE_JSON=$(find .build-extract \
-            -type f \
-            -name "package.json" \
-            -not -path "*/node_modules/*" \
-            | head -1)
-
-          if [ -z "$PACKAGE_JSON" ]; then
-            echo "::error::No package.json found after extraction"
-            echo ""
-            echo "Extracted directory:"
-            find .build-extract -maxdepth 4 -print
-            exit 1
-          fi
-
-          echo "package.json found:"
-          echo "$PACKAGE_JSON"
-
-          # الحصول على مجلد المشروع
-          PROJECT_ROOT=$(dirname "$PACKAGE_JSON")
-
-          echo ""
-          echo "Project root:"
-          echo "$PROJECT_ROOT"
-
-          # نسخ المشروع كاملاً بما فيه الملفات المخفية
-          cp -a "$PROJECT_ROOT"/. covenant-android-project/
-
-          echo ""
-          echo "Final project structure:"
-          find covenant-android-project -maxdepth 2 -type f | head -100
-
-          echo ""
-          echo "Project prepared successfully."
-
-
-      # ==============================
-      # 4. Verify project
-      # ==============================
-      - name: Verify project structure
-        working-directory: covenant-android-project
-        shell: bash
-        run: |
-          set -e
-
-          echo "Checking project structure..."
-
-          if [ ! -f package.json ]; then
-            echo "::error::package.json missing"
-            exit 1
-          fi
-
-          echo "package.json:"
-          ls -lh package.json
-
-          if [ -f package-lock.json ]; then
-            echo "package-lock.json found"
+          if [ -n "$INPUT_ZIP" ]; then
+            ZIP_FILE="$INPUT_ZIP"
+            if [ ! -f "$ZIP_FILE" ]; then
+              echo "❌ الملف المحدد غير موجود: $ZIP_FILE"
+              exit 1
+            fi
           else
-            echo "No package-lock.json found"
+            ZIP_FILE=$(find . -maxdepth 1 -iname "KOVANT*.zip" -type f | pick_latest)
           fi
 
-          if [ -f capacitor.config.ts ]; then
-            echo "capacitor.config.ts found"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "❌ لا توجد أي حزمة KOVANT*.zip في هذا المستودع. الحزم الموجودة:"
+            ls -la *.zip 2>/dev/null || echo "(لا توجد أي zip)"
+            exit 1
           fi
+          echo "✅ تم اختيار: $ZIP_FILE"
 
-          if [ -f capacitor.config.json ]; then
-            echo "capacitor.config.json found"
+          # كود الخروج 1 في unzip يعني تحذيراً فقط (مثل ترميز أسماء الملفات)
+          unzip -q "$ZIP_FILE" -d extracted || {
+            rc=$?
+            if [ "$rc" -le 1 ]; then
+              echo "⚠️ unzip أعطى تحذيراً (rc=$rc) — نتابع"
+            else
+              echo "❌ فشل فك الضغط (rc=$rc)"
+              exit "$rc"
+            fi
+          }
+          echo "=== محتويات extracted/ ==="
+          ls -la extracted/
+
+      - name: Flatten Project Structure
+        run: |
+          echo "=== البحث عن google-services.json ==="
+          GS=$(find extracted -maxdepth 3 -name "google-services.json" -type f | head -1)
+          
+          if [ -z "$GS" ]; then
+            echo "❌ google-services.json غير موجود!"
+            find extracted -type f | head -30
+            exit 1
           fi
-
-          if [ -d android ]; then
-            echo "Android directory already exists"
-          else
-            echo "Android directory does not exist yet"
+          
+          ROOT_DIR=$(dirname "$GS")
+          echo "✅ google-services.json في: $GS"
+          echo "📁 المجلد الجذري: $ROOT_DIR"
+          
+          if [ "$ROOT_DIR" != "extracted" ]; then
+            echo "🔄 نقل الملفات من $ROOT_DIR إلى extracted/"
+            shopt -s dotglob
+            for item in "$ROOT_DIR"/*; do
+              if [ -e "$item" ]; then
+                mv "$item" extracted/ 2>/dev/null || true
+              fi
+            done
+            shopt -u dotglob
+            rm -rf "$ROOT_DIR"
+            echo "✅ تم نقل الملفات"
           fi
+          
+          echo "=== محتويات extracted/ ==="
+          ls -la extracted/
 
-          echo ""
-          echo "Basic project structure OK"
+      - name: Verify Critical Files
+        run: |
+          if [ ! -f "extracted/google-services.json" ]; then
+            echo "❌ google-services.json مفقود!"
+            exit 1
+          fi
+          echo "✅ google-services.json موجود"
+          
+          if [ ! -d "extracted/native-plugins/android" ]; then
+            echo "❌ مجلد native-plugins/android مفقود!"
+            ls -la extracted/
+            exit 1
+          fi
+          echo "✅ native-plugins/android موجود"
+          
+          if [ ! -f "extracted/package.json" ]; then
+            echo "❌ package.json مفقود!"
+            exit 1
+          fi
+          echo "✅ package.json موجود"
+          
+          if [ ! -f "extracted/capacitor.config.json" ]; then
+            echo "❌ capacitor.config.json مفقود!"
+            exit 1
+          fi
+          echo "✅ capacitor.config.json موجود"
 
+          # ===== التحقق من أن الـ ZIP يحمل إصلاحات SMS (وليس نسخة قديمة) =====
+          J="extracted/android/app/src/main/java/com/kova/cash"
+          for f in SMSForegroundService.java SMSWorker.java SmsGatewaySettings.java MainActivity.kt; do
+            if [ ! -f "$J/$f" ]; then
+              echo "❌ $J/$f غير موجود في الـ ZIP — هذا ليس الإصدار المُصلَح"
+              exit 1
+            fi
+          done
+          for f in SMSForegroundService.java SMSWorker.java; do
+            if ! grep -q "SmsGatewaySettings" "$J/$f"; then
+              echo "❌ $f لا يحتوي SmsGatewaySettings — نسخة قديمة بلا إصلاحات SMS"
+              exit 1
+            fi
+          done
+          echo "✅ ملفات Java المُصلَحة موجودة في الـ ZIP"
 
-      # ==============================
-      # 5. Setup Node
-      # ==============================
+          if [ ! -f "extracted/native-plugins/android/TuaSmsSettingsPlugin.kt" ]; then
+            echo "❌ native-plugins/android/TuaSmsSettingsPlugin.kt مفقود!"
+            exit 1
+          fi
+          echo "✅ TuaSmsSettingsPlugin.kt موجود"
+
+          if [ ! -f "extracted/js/sms-settings-bridge.js" ]; then
+            echo "❌ js/sms-settings-bridge.js مفقود!"
+            exit 1
+          fi
+          if ! grep -q 'js/sms-settings-bridge.js' extracted/index.html; then
+            echo "❌ index.html لا يحتوي <script src=\"js/sms-settings-bridge.js\">"
+            exit 1
+          fi
+          echo "✅ sms-settings-bridge.js موجود ومضمَّن في index.html"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'
 
-
-      # ==============================
-      # 6. Install dependencies
-      # ==============================
-      - name: Install dependencies
-        working-directory: covenant-android-project
-        shell: bash
-        run: |
-          set -e
-
-          echo "Node version:"
-          node --version
-
-          echo "NPM version:"
-          npm --version
-
-          echo ""
-          echo "Installing dependencies..."
-
-          if [ -f package-lock.json ]; then
-            echo "Using npm ci..."
-            npm ci --legacy-peer-deps
-          else
-            echo "package-lock.json not found."
-            echo "Using npm install..."
-            npm install --legacy-peer-deps
-          fi
-
-          echo ""
-          echo "Dependencies installed successfully."
-
-
-      # ==============================
-      # 7. Capacitor Android
-      # ==============================
-      - name: Sync Capacitor Android
-        working-directory: covenant-android-project
-        shell: bash
-        run: |
-          set -e
-
-          echo "Checking Capacitor..."
-
-          npx cap --version
-
-          echo ""
-
-          if [ ! -d android ]; then
-            echo "Android platform not found."
-            echo "Adding Android platform..."
-
-            npx cap add android
-          else
-            echo "Android platform already exists."
-          fi
-
-          echo ""
-          echo "Syncing Capacitor..."
-
-          npx cap sync android
-
-          echo ""
-          echo "Capacitor Android sync completed."
-
-
-      # ==============================
-      # 8. Setup Java 17
-      # ==============================
-      - name: Setup JDK 17
+      - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
+          distribution: 'temurin'
+          java-version: '21'
 
-
-      # ==============================
-      # 9. Build APK
-      # ==============================
-      - name: Build debug APK
-        working-directory: covenant-android-project/android
-        shell: bash
+      - name: Fix Config Files
+        working-directory: ./extracted
         run: |
-          set -e
+          node -e "
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          pkg.name = pkg.name || 'kovant';
+          pkg.version = pkg.version || '1.0.0';
+          pkg.dependencies = {
+            '@capacitor/android': '^6.0.0',
+            '@capacitor/app': '^6.0.0',
+            '@capacitor/app-launcher': '^6.0.0',
+            '@capacitor/cli': '^6.0.0',
+            '@capacitor/core': '^6.0.0',
+            '@capacitor/preferences': '^6.0.0',
+            '@capacitor-firebase/messaging': '^6.0.0',
+            '@capacitor/local-notifications': '^6.0.0',
+            '@capacitor/geolocation': '^6.0.0',
+            '@capawesome-team/capacitor-android-battery-optimization': '^8.0.0'
+          };
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+          console.log('✅ package.json محدّث');
+          "
+          
+          node -e "
+          const fs = require('fs');
+          const cfg = JSON.parse(fs.readFileSync('capacitor.config.json', 'utf8'));
+          cfg.appId = cfg.appId || 'com.kova.cash';
+          cfg.appName = cfg.appName || 'Kovant';
+          cfg.webDir = 'www';
+          delete cfg.bundledWebRuntime;
+          cfg.server = {
+            allowNavigation: ['kova-cash-default-rtdb.firebaseio.com', '*.onrender.com'],
+            cleartext: false
+          };
+          cfg.plugins = {
+            SmsInbox: { enabled: true },
+            SmsWatcher: { enabled: true },
+            Sim: { enabled: true },
+            BatteryOptimization: { enabled: true },
+            TuaSmsSender: { enabled: true },
+            TuaSmsInbox: { enabled: true },
+            TuaSmsSettings: { enabled: true },
+            TuaBiometric: { enabled: true },
+            TuaWifiManager: { enabled: true },
+            CovaTrafficStats: { enabled: true },
+            TuaNotification: { enabled: true },
+            CapacitorHttp: { enabled: true },
+            LocalNotifications: { enabled: true },
+            Geolocation: { enabled: true },
+            AppLauncher: { enabled: true },
+            FirebaseMessaging: { enabled: true },
+            Preferences: { enabled: true }
+          };
+          fs.writeFileSync('capacitor.config.json', JSON.stringify(cfg, null, 2));
+          console.log('✅ capacitor.config.json محدّث');
+          "
+          
+          mkdir -p www
+          for item in *; do
+            if [ "$item" != "www" ] && [ "$item" != "node_modules" ] && [ "$item" != "android" ]; then
+              cp -r "$item" www/ 2>/dev/null || true
+            fi
+          done
+          
+          if [ ! -f "www/index.html" ]; then
+            INDEX_FILE=$(find . -maxdepth 2 -name "index*.html" -type f | head -1)
+            if [ -n "$INDEX_FILE" ]; then
+              cp "$INDEX_FILE" www/index.html
+            fi
+          fi
+          
+          if [ ! -f "www/index.html" ]; then
+            echo "❌ index.html مفقود تمامًا!"
+            exit 1
+          fi
+          echo "✅ www/index.html جاهز"
 
-          echo "Java version:"
-          java -version
-
-          echo ""
-          echo "Gradle version:"
-          ./gradlew --version
-
-          echo ""
-          echo "Building debug APK..."
-
-          chmod +x gradlew
-
-          ./gradlew clean assembleDebug --stacktrace
-
-          echo ""
-          echo "APK build completed."
-
-
-      # ==============================
-      # 10. Locate APK
-      # ==============================
-      - name: Locate APK
-        id: apk
-        shell: bash
+      - name: Verify Web Files in www
+        working-directory: ./extracted
         run: |
-          set -e
+          if [ ! -f "www/js/sms-settings-bridge.js" ]; then
+            echo "❌ www/js/sms-settings-bridge.js لم يُنسخ إلى www"
+            ls -la www/js | head -30
+            exit 1
+          fi
+          if ! grep -q '<script src="js/sms-settings-bridge.js"></script>' www/index.html; then
+            echo "❌ www/index.html لا يحتوي سطر <script src=\"js/sms-settings-bridge.js\"></script>"
+            exit 1
+          fi
+          # يجب أن يأتي الجسر بعد sms-logic.js
+          L1=$(grep -n 'js/sms-logic.js' www/index.html | head -1 | cut -d: -f1)
+          L2=$(grep -n 'js/sms-settings-bridge.js' www/index.html | head -1 | cut -d: -f1)
+          if [ -z "$L1" ] || [ "$L2" -le "$L1" ]; then
+            echo "❌ ترتيب السكربتات خاطئ: sms-settings-bridge.js يجب أن يأتي بعد sms-logic.js"
+            exit 1
+          fi
+          echo "✅ ملفات الويب سليمة (الجسر في www وبعد sms-logic.js)"
 
-          echo "Searching for APK..."
+      - name: Install npm deps
+        working-directory: ./extracted
+        run: npm install --legacy-peer-deps --force
 
-          APK_PATH=$(find \
-            covenant-android-project/android/app/build/outputs/apk/debug \
-            -type f \
-            -name "*.apk" \
-            | head -1)
+      # ═══════════════════════════════════════════════════════════
+      # ⭐ جديد: احفظ ملفات Java/Kotlin المُصلَحة من الـ ZIP قبل أن يمسح
+      #    "rm -rf android" المجلد (cap add android يبني مجلداً جديداً)
+      # ═══════════════════════════════════════════════════════════
+      - name: Stash SMS Overlay from ZIP
+        run: |
+          SRC="extracted/android/app/src/main/java/com/kova/cash"
+          rm -rf /tmp/kova-overlay
+          mkdir -p /tmp/kova-overlay
+          cp -a "$SRC/." /tmp/kova-overlay/
+          echo "=== الملفات المحفوظة من الـ ZIP ==="
+          ls -la /tmp/kova-overlay
 
-          if [ -z "$APK_PATH" ]; then
-            echo "::error::APK not found after build"
+      - name: Add Android Platform
+        working-directory: ./extracted
+        run: |
+          rm -rf android
+          npx cap add android 2>&1 || {
+            echo "❌ npx cap add android فشل — محاولة بديلة"
+            npm install @capacitor/android@^6.0.0 @capacitor/cli@^6.0.0 --save-dev --legacy-peer-deps
+            npx cap add android 2>&1
+          }
 
-            echo ""
-            echo "Build output:"
-            find covenant-android-project/android/app/build/outputs \
-              -type f 2>/dev/null || true
+      - name: Copy google-services.json
+        working-directory: ./extracted
+        run: |
+          mkdir -p android/app
+          cp google-services.json android/app/google-services.json
+          echo "✅ google-services.json copied"
 
+      - name: Enable Google Services Plugin
+        working-directory: ./extracted/android
+        run: |
+          if ! grep -q "com.google.gms:google-services" build.gradle; then
+            sed -i "s|classpath 'com.android.tools.build:gradle|classpath 'com.google.gms:google-services:4.4.0'\n        classpath 'com.android.tools.build:gradle|" build.gradle
+            echo "✅ google-services classpath added"
+          fi
+          
+          if ! grep -q "com.google.gms.google-services" app/build.gradle; then
+            echo "apply plugin: 'com.google.gms.google-services'" >> app/build.gradle
+            echo "✅ google-services plugin applied"
+          fi
+
+      - name: Enable Kotlin Support
+        working-directory: ./extracted/android
+        run: |
+          KOTLIN_VERSION="1.9.24"
+          
+          sed -i '/kotlin-gradle-plugin/d' build.gradle
+          sed -i '/kotlin-android/d' app/build.gradle
+          
+          sed -i "/classpath 'com.android.tools.build:gradle/a\\        classpath \"org.jetbrains.kotlin:kotlin-gradle-plugin:${KOTLIN_VERSION}\"" build.gradle
+          
+          echo "apply plugin: 'kotlin-android'" >> app/build.gradle
+          
+          if ! grep -q "kotlin-stdlib" app/build.gradle; then
+            sed -i '/^dependencies {/a\    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"\n    implementation "androidx.biometric:biometric:1.1.0"\n    implementation "androidx.security:security-crypto:1.1.0-alpha06"\n    implementation "androidx.fragment:fragment-ktx:1.6.2"\n    implementation "androidx.appcompat:appcompat:1.6.1"\n    implementation "androidx.core:core-ktx:1.12.0"\n    implementation "androidx.activity:activity-ktx:1.8.2"' app/build.gradle
+            echo "✅ Dependencies added"
+          fi
+          
+          if ! grep -q "jvmTarget" app/build.gradle; then
+            echo "" >> app/build.gradle
+            echo "tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {" >> app/build.gradle
+            echo "    kotlinOptions {" >> app/build.gradle
+            echo "        jvmTarget = '17'" >> app/build.gradle
+            echo "    }" >> app/build.gradle
+            echo "}" >> app/build.gradle
+            echo "" >> app/build.gradle
+            echo "tasks.withType(JavaCompile).configureEach {" >> app/build.gradle
+            echo "    sourceCompatibility = JavaVersion.VERSION_17" >> app/build.gradle
+            echo "    targetCompatibility = JavaVersion.VERSION_17" >> app/build.gradle
+            echo "}" >> app/build.gradle
+            echo "✅ JVM target appended"
+          fi
+
+      - name: Add Firebase and Network Dependencies
+        working-directory: ./extracted/android
+        run: |
+          if ! grep -q "firebase-database" app/build.gradle; then
+            sed -i '/^dependencies {/a\    implementation platform("com.google.firebase:firebase-bom:32.7.0")\n    implementation "com.google.firebase:firebase-database"\n    implementation "com.google.firebase:firebase-auth"' app/build.gradle
+            echo "✅ Firebase added"
+          fi
+          if ! grep -q "com.squareup.okhttp3:okhttp" app/build.gradle; then
+            sed -i '/^dependencies {/a\    implementation "com.squareup.okhttp3:okhttp:4.12.0"' app/build.gradle
+            echo "✅ OkHttp added"
+          fi
+          if ! grep -q "androidx.work:work-runtime" app/build.gradle; then
+            sed -i '/^dependencies {/a\    implementation "androidx.work:work-runtime:2.9.0"' app/build.gradle
+            echo "✅ WorkManager added"
+          fi
+          
+          grep -q "firebase-auth" app/build.gradle && echo "✅ Auth OK"
+          grep -q "okhttp" app/build.gradle && echo "✅ OkHttp OK"
+
+      - name: Upgrade Gradle
+        working-directory: ./extracted/android
+        run: |
+          sed -i 's|gradle-8.2.1-all.zip|gradle-8.7-all.zip|' gradle/wrapper/gradle-wrapper.properties
+          echo "✅ Gradle upgraded"
+
+      - name: Sync Android
+        working-directory: ./extracted
+        run: npx cap sync android
+
+      - name: Copy Res Files
+        run: |
+          mkdir -p extracted/android/app/src/main/res/layout
+          mkdir -p extracted/android/app/src/main/res/drawable
+          
+          if [ -f extracted/native-plugins/android/res/layout/cova_notification.xml ]; then
+            cp extracted/native-plugins/android/res/layout/cova_notification.xml extracted/android/app/src/main/res/layout/cova_notification.xml
+          fi
+          
+          if [ -f extracted/native-plugins/android/res/drawable/cova_speed_badge_bg.xml ]; then
+            cp extracted/native-plugins/android/res/drawable/cova_speed_badge_bg.xml extracted/android/app/src/main/res/drawable/cova_speed_badge_bg.xml
+          fi
+          
+          if ls extracted/native-plugins/android/res/values* 1> /dev/null 2>&1; then
+            cp -r extracted/native-plugins/android/res/values* extracted/android/app/src/main/res/
+          fi
+
+      # ═══════════════════════════════════════════════════════════
+      # ⭐ جديد: أعد ملفات Java/Kotlin من الـ ZIP فوق مشروع cap الجديد
+      #    (بدل خطوتي "Add SMS Gateway Files" و"Create MainActivity" المحذوفتين)
+      # ═══════════════════════════════════════════════════════════
+      - name: Restore SMS Overlay (Java + MainActivity from ZIP)
+        run: |
+          DEST="extracted/android/app/src/main/java/com/kova/cash"
+          mkdir -p "$DEST"
+
+          # حذف MainActivity الافتراضي الذي أنشأه cap add (وليس ملفك) كي لا يتكرر التعريف
+          if [ -f /tmp/kova-overlay/MainActivity.kt ]; then
+            rm -f "$DEST/MainActivity.java"
+          fi
+          if [ -f /tmp/kova-overlay/MainActivity.java ]; then
+            rm -f "$DEST/MainActivity.kt"
+          fi
+
+          cp -av /tmp/kova-overlay/. "$DEST"/
+
+          echo "=== ملفات الحزمة بعد الاستعادة ==="
+          ls -la "$DEST"
+
+          # تأكد أن الإصلاحات وصلت فعلاً
+          for f in SMSForegroundService.java SMSWorker.java; do
+            if ! grep -q "SmsGatewaySettings" "$DEST/$f"; then
+              echo "❌ $f بعد النسخ لا يحتوي إصلاحات SMS"
+              exit 1
+            fi
+          done
+          test -f "$DEST/SmsGatewaySettings.java" || { echo "❌ SmsGatewaySettings.java مفقود بعد النسخ"; exit 1; }
+          echo "✅ إصلاحات SMS في مكانها"
+
+      - name: Copy Native Plugins
+        run: |
+          mkdir -p extracted/android/app/src/main/java/com/kova/cash/plugins
+          
+          PLUGINS_DIR="extracted/android/app/src/main/java/com/kova/cash/plugins"
+          SOURCE_DIR="extracted/native-plugins/android"
+          
+          if [ -f "$SOURCE_DIR/TuaSmsSenderPlugin.kt" ]; then
+            cp "$SOURCE_DIR/TuaSmsSenderPlugin.kt" "$PLUGINS_DIR/TuaSmsSenderPlugin.kt"
+            sed -i 's/fun checkPermissions(call: PluginCall)/override fun checkPermissions(call: PluginCall)/' "$PLUGINS_DIR/TuaSmsSenderPlugin.kt"
+            sed -i 's/fun requestPermissions(call: PluginCall)/override fun requestPermissions(call: PluginCall)/' "$PLUGINS_DIR/TuaSmsSenderPlugin.kt"
+          fi
+          
+          for plugin in TuaBiometricPlugin TuaWifiManagerPlugin TuaTrafficStatsPlugin TuaNotificationPlugin TuaSmsInboxPlugin TuaSmsSettingsPlugin SpeedOverlayService CovaForegroundService; do
+            if [ -f "$SOURCE_DIR/$plugin.kt" ]; then
+              cp "$SOURCE_DIR/$plugin.kt" "$PLUGINS_DIR/$plugin.kt"
+              echo "✅ copied $plugin.kt"
+            fi
+          done
+
+          test -f "$PLUGINS_DIR/TuaSmsSettingsPlugin.kt" || { echo "❌ TuaSmsSettingsPlugin.kt لم يُنسخ"; exit 1; }
+
+      # ═══════════════════════════════════════════════════════════
+      # ⭐ جديد: يحافظ على MainActivity القادم من الـ ZIP، ويضيف فقط ما ينقصه:
+      #   1) import + registerPlugin لكل مكوّن محلي (ومنها TuaSmsSettingsPlugin) قبل super.onCreate()
+      #   2) جسر الأدمن KovantAdminBridge إن لم يكن موجوداً (js/auth.js يستدعيه)
+      #   التعديل idempotent: لا يكرّر شيئاً موجوداً أصلاً.
+      # ═══════════════════════════════════════════════════════════
+      - name: Prepare MainActivity (register plugins, keep ZIP version)
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+
+          base = pathlib.Path('extracted/android/app/src/main/java/com/kova/cash')
+          main = base / 'MainActivity.kt'
+          plugins_dir = base / 'plugins'
+
+          def fail(msg):
+              print('❌ ' + msg)
+              sys.exit(1)
+
+          if not main.is_file():
+              fail('MainActivity.kt غير موجود في ' + str(base) + ' (يجب أن يأتي من الـ ZIP بصيغة Kotlin)')
+
+          text = main.read_text(encoding='utf-8')
+
+          # ---- 1) اكتشاف كل المكوّنات المحلية (@CapacitorPlugin) ----
+          classes = []
+          for f in sorted(plugins_dir.glob('*.kt')):
+              src = f.read_text(encoding='utf-8')
+              if '@CapacitorPlugin' not in src:
+                  continue
+              m = re.search(r'^class\s+(\w+)\s*:\s*Plugin\(\)', src, re.M)
+              if m:
+                  classes.append(m.group(1))
+          print('المكوّنات المكتشفة:', classes)
+          if 'TuaSmsSettingsPlugin' not in classes:
+              fail('TuaSmsSettingsPlugin غير موجود ضمن plugins/')
+
+          SUPER_RE = re.compile(r'^([ \t]*)super\.onCreate\(\s*\w+\s*\)[ \t]*$', re.M)
+          if not SUPER_RE.search(text):
+              fail('لم أجد super.onCreate(savedInstanceState) في MainActivity.kt')
+
+          def add_imports(t, imports):
+              missing = [i for i in imports if not re.search(r'^import\s+' + re.escape(i) + r'\s*$', t, re.M)]
+              if not missing:
+                  return t
+              block = '\n'.join('import ' + i for i in missing)
+              found = list(re.finditer(r'^import\s+.+$', t, re.M))
+              if found:
+                  pos = found[-1].end()
+                  return t[:pos] + '\n' + block + t[pos:]
+              m = re.search(r'^package\s+.+$', t, re.M)
+              if not m:
+                  fail('لا يوجد سطر package في MainActivity.kt')
+              return t[:m.end()] + '\n\n' + block + t[m.end():]
+
+          # ---- تسجيل المكوّنات قبل super.onCreate ----
+          text = add_imports(text, ['com.kova.cash.plugins.' + c for c in classes])
+          sup = SUPER_RE.search(text)
+          indent = sup.group(1)
+          regs = []
+          for c in classes:
+              if not re.search(r'registerPlugin\(\s*' + c + r'::class\.java\s*\)', text):
+                  regs.append(indent + 'registerPlugin(' + c + '::class.java)')
+          if regs:
+              text = text[:sup.start()] + '\n'.join(regs) + '\n' + text[sup.start():]
+              print('أُضيف التسجيل لـ:', len(regs), 'مكوّن')
+          else:
+              print('كل المكوّنات مسجّلة أصلاً')
+
+          # ---- 2) جسر الأدمن إن كان غائباً ----
+          if 'KovantAdminBridge' in text:
+              print('✅ KovantAdminBridge موجود في MainActivity — لا حاجة للحقن')
+          else:
+              print('⚠️ KovantAdminBridge غير موجود في MainActivity القادم من الـ ZIP — سيُضاف')
+              text = add_imports(text, [
+                  'android.Manifest', 'android.content.Intent', 'android.content.pm.PackageManager',
+                  'android.net.Uri', 'android.os.Build', 'android.os.PowerManager',
+                  'android.provider.Settings', 'android.webkit.JavascriptInterface',
+                  'androidx.core.app.ActivityCompat', 'androidx.core.content.ContextCompat',
+              ])
+              sup = SUPER_RE.search(text)
+              indent = sup.group(1)
+              calls = '\n'.join([
+                  indent + 'kvRequestNotificationPermission()',
+                  indent + 'bridge.webView.addJavascriptInterface(AdminBridge(), "KovantAdminBridge")',
+                  indent + 'if (kvIsAdmin()) {',
+                  indent + '    kvStartSmsServiceInternal()',
+                  indent + '    SMSWorkerScheduler.schedule(this)',
+                  indent + '}',
+              ])
+              text = text[:sup.end()] + '\n' + calls + text[sup.end():]
+
+              members = '''
+              // ===== CI: جسر الأدمن (حُقن لأن MainActivity في الـ ZIP لا يحتويه) =====
+              private val KV_REQ_NOTIF = 7401
+              private val KV_REQ_SMS = 7402
+
+              private fun kvIsAdmin(): Boolean {
+                  val prefs = getSharedPreferences("CapacitorStorage", MODE_PRIVATE)
+                  return prefs.getString("is_admin", "") == "true"
+              }
+
+              private fun kvStartSmsServiceInternal() {
+                  kvRequestSmsPermissions()
+                  kvRequestBatteryOptimizationExemption()
+                  kvStartSmsForegroundService()
+              }
+
+              inner class AdminBridge {
+                  @JavascriptInterface
+                  fun startSmsService() {
+                      getSharedPreferences("CapacitorStorage", MODE_PRIVATE).edit().putString("is_admin", "true").apply()
+                      runOnUiThread {
+                          kvStartSmsServiceInternal()
+                          SMSWorkerScheduler.schedule(this@MainActivity)
+                      }
+                  }
+
+                  @JavascriptInterface
+                  fun stopSmsService() {
+                      getSharedPreferences("CapacitorStorage", MODE_PRIVATE).edit().putString("is_admin", "false").apply()
+                      stopService(Intent(this@MainActivity, SMSForegroundService::class.java))
+                      SMSWorkerScheduler.cancel(this@MainActivity)
+                  }
+              }
+
+              private fun kvRequestSmsPermissions() {
+                  val permissions = mutableListOf<String>()
+                  val smsPermissions = arrayOf(
+                      Manifest.permission.RECEIVE_SMS,
+                      Manifest.permission.READ_SMS,
+                      Manifest.permission.SEND_SMS,
+                      Manifest.permission.READ_PHONE_STATE
+                  )
+                  smsPermissions.forEach { permission ->
+                      if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+                          permissions.add(permission)
+                      }
+                  }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                      ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_NUMBERS) != PackageManager.PERMISSION_GRANTED) {
+                      permissions.add(Manifest.permission.READ_PHONE_NUMBERS)
+                  }
+                  if (permissions.isNotEmpty()) {
+                      ActivityCompat.requestPermissions(this, permissions.toTypedArray(), KV_REQ_SMS)
+                  }
+              }
+
+              private fun kvStartSmsForegroundService() {
+                  try {
+                      val serviceIntent = Intent(this, SMSForegroundService::class.java)
+                      serviceIntent.action = SMSForegroundService.ACTION_START
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          ContextCompat.startForegroundService(this, serviceIntent)
+                      } else {
+                          startService(serviceIntent)
+                      }
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                  }
+              }
+
+              private fun kvRequestNotificationPermission() {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), KV_REQ_NOTIF)
+                  }
+              }
+
+              private fun kvRequestBatteryOptimizationExemption() {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+                  val pm = getSystemService(POWER_SERVICE) as? PowerManager ?: return
+                  val pkgName = packageName
+                  if (!pm.isIgnoringBatteryOptimizations(pkgName)) {
+                      try {
+                          val intent = Intent(
+                              Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                              Uri.parse("package:$pkgName")
+                          )
+                          startActivity(intent)
+                      } catch (e: Exception) {}
+                  }
+              }
+              '''
+              # إزالة مسافات YAML الزائدة من كتلة الأعضاء ثم إضافتها بمسافة صف واحدة
+              lines = members.split('\n')
+              strip = min(len(l) - len(l.lstrip()) for l in lines if l.strip())
+              members = '\n'.join(l[strip:] if l.strip() else '' for l in lines)
+              members = '\n'.join(('    ' + l if l.strip() else '') for l in members.split('\n'))
+              end = text.rfind('}')
+              if end == -1:
+                  fail('لم أجد قوس إغلاق الصنف في MainActivity.kt')
+              text = text[:end].rstrip('\n') + '\n' + members.rstrip() + '\n' + text[end:]
+
+          main.write_text(text, encoding='utf-8')
+
+          # ---- التحقق النهائي: التسجيل يسبق super.onCreate ----
+          final = main.read_text(encoding='utf-8')
+          i_reg = final.find('registerPlugin(TuaSmsSettingsPlugin::class.java)')
+          i_sup = SUPER_RE.search(final).start()
+          if i_reg == -1 or i_reg > i_sup:
+              fail('registerPlugin(TuaSmsSettingsPlugin::class.java) غير موجود قبل super.onCreate')
+          print('✅ registerPlugin(TuaSmsSettingsPlugin::class.java) موجود قبل super.onCreate')
+          print('================ MainActivity.kt النهائي ================')
+          print(final)
+          PY
+
+      - name: Add Permissions and Services
+        run: |
+          MANIFEST="extracted/android/app/src/main/AndroidManifest.xml"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "❌ AndroidManifest.xml NOT FOUND"
             exit 1
           fi
 
+          if ! grep -q "SEND_SMS" "$MANIFEST"; then
+            awk '/<application/ && !done {
+              print "    <uses-permission android:name=\"android.permission.SEND_SMS\" />"
+              print "    <uses-permission android:name=\"android.permission.READ_SMS\" />"
+              print "    <uses-permission android:name=\"android.permission.RECEIVE_SMS\" />"
+              print "    <uses-permission android:name=\"android.permission.READ_PHONE_STATE\" />"
+              print "    <uses-permission android:name=\"android.permission.READ_PHONE_NUMBERS\" />"
+              print "    <uses-permission android:name=\"android.permission.POST_NOTIFICATIONS\" />"
+              print "    <uses-permission android:name=\"android.permission.RECEIVE_BOOT_COMPLETED\" />"
+              print "    <uses-permission android:name=\"android.permission.WAKE_LOCK\" />"
+              print "    <uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\" />"
+              print "    <uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\" />"
+              print "    <uses-permission android:name=\"android.permission.CAMERA\" />"
+              print "    <uses-permission android:name=\"android.permission.USE_BIOMETRIC\" />"
+              print "    <uses-permission android:name=\"android.permission.USE_FINGERPRINT\" />"
+              print "    <uses-permission android:name=\"android.permission.ACCESS_WIFI_STATE\" />"
+              print "    <uses-permission android:name=\"android.permission.CHANGE_WIFI_STATE\" />"
+              print "    <uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\" />"
+              print "    <uses-permission android:name=\"android.permission.INTERNET\" />"
+              print "    <uses-permission android:name=\"android.permission.CHANGE_NETWORK_STATE\" />"
+              print "    <uses-permission android:name=\"android.permission.VIBRATE\" />"
+              print "    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE\" />"
+              print "    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE_DATA_SYNC\" />"
+              print "    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE_SPECIAL_USE\" />"
+              print "    <uses-permission android:name=\"android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS\" />"
+              print "    <uses-permission android:name=\"android.permission.SYSTEM_ALERT_WINDOW\" />"
+              print "    <uses-permission android:name=\"com.google.android.c2dm.permission.RECEIVE\" />"
+              print ""
+              done=1
+            }
+            { print }' "$MANIFEST" > /tmp/m1.xml
+            mv /tmp/m1.xml "$MANIFEST"
+            echo "✅ Permissions added"
+          fi
+
+          if ! grep -q "CovaForegroundService" "$MANIFEST"; then
+            awk '/<\/application>/ && !done {
+              print "    <service"
+              print "        android:name=\"com.kova.cash.plugins.CovaForegroundService\""
+              print "        android:enabled=\"true\""
+              print "        android:exported=\"false\""
+              print "        android:foregroundServiceType=\"dataSync\" />"
+              print ""
+              done=1
+            }
+            { print }' "$MANIFEST" > /tmp/m3.xml
+            mv /tmp/m3.xml "$MANIFEST"
+            echo "✅ CovaForegroundService added"
+          fi
+
+          if ! grep -q "SpeedOverlayService" "$MANIFEST"; then
+            awk '/<\/application>/ && !done {
+              print "    <service"
+              print "        android:name=\"com.kova.cash.plugins.SpeedOverlayService\""
+              print "        android:enabled=\"true\""
+              print "        android:exported=\"false\""
+              print "        android:foregroundServiceType=\"specialUse\">"
+              print "        <property"
+              print "            android:name=\"android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE\""
+              print "            android:value=\"network_speed_monitoring\" />"
+              print "    </service>"
+              print ""
+              done=1
+            }
+            { print }' "$MANIFEST" > /tmp/m4.xml
+            mv /tmp/m4.xml "$MANIFEST"
+            echo "✅ SpeedOverlayService added"
+          fi
+
+      - name: Register SMS Gateway in Manifest
+        run: |
+          MANIFEST="extracted/android/app/src/main/AndroidManifest.xml"
+
+          if ! grep -q "SMSForegroundService" "$MANIFEST"; then
+            awk '/<\/application>/ && !done {
+              print "    <service"
+              print "        android:name=\".SMSForegroundService\""
+              print "        android:enabled=\"true\""
+              print "        android:exported=\"false\""
+              print "        android:foregroundServiceType=\"dataSync\" />"
+              print ""
+              done=1
+            }
+            { print }' "$MANIFEST" > /tmp/m5.xml
+            mv /tmp/m5.xml "$MANIFEST"
+            echo "✅ SMSForegroundService registered"
+          fi
+
+          if ! grep -q "BootReceiver" "$MANIFEST"; then
+            awk '/<\/application>/ && !done {
+              print "    <receiver"
+              print "        android:name=\".BootReceiver\""
+              print "        android:enabled=\"true\""
+              print "        android:exported=\"true\""
+              print "        android:directBootAware=\"true\">"
+              print "        <intent-filter>"
+              print "            <action android:name=\"android.intent.action.BOOT_COMPLETED\" />"
+              print "            <action android:name=\"android.intent.action.LOCKED_BOOT_COMPLETED\" />"
+              print "            <action android:name=\"com.htc.intent.action.QUICKBOOT_POWERON\" />"
+              print "        </intent-filter>"
+              print "    </receiver>"
+              print ""
+              done=1
+            }
+            { print }' "$MANIFEST" > /tmp/m6.xml
+            mv /tmp/m6.xml "$MANIFEST"
+            echo "✅ BootReceiver registered"
+          fi
+
+          grep -q "SMSForegroundService" "$MANIFEST" && echo "✅ Service OK"
+          grep -q "BootReceiver" "$MANIFEST" && echo "✅ Receiver OK"
+          grep -q "android.permission.INTERNET" "$MANIFEST" && echo "✅ INTERNET OK"
+          grep -q "android.permission.CAMERA" "$MANIFEST" && echo "✅ CAMERA OK"
+
+
+      - name: Register Connectivity Receiver
+        run: |
+          MANIFEST="extracted/android/app/src/main/AndroidManifest.xml"
+          if ! grep -q "ConnectivityReceiver" "$MANIFEST"; then
+            awk '/<\/application>/ && !done {
+              print "    <receiver android:name=\".ConnectivityReceiver\" android:enabled=\"true\" android:exported=\"false\">"
+              print "        <intent-filter><action android:name=\"android.net.conn.CONNECTIVITY_CHANGE\" /></intent-filter>"
+              print "    </receiver>"
+              done=1
+            }
+            { print }' "$MANIFEST" > /tmp/m7.xml
+            mv /tmp/m7.xml "$MANIFEST"
+          fi
+          if ! grep -q "android.permission.ACCESS_NETWORK_STATE" "$MANIFEST"; then
+            sed -i '/<application/i\    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />' "$MANIFEST"
+          fi
+          echo "✅ ConnectivityReceiver and network permission ready"
+
+      - name: Deduplicate Manifest Declarations
+        run: |
+          MANIFEST="extracted/android/app/src/main/AndroidManifest.xml"
+          awk '!seen[$0]++ || $0 !~ /android.permission.INTERNET/ { print }' "$MANIFEST" > /tmp/manifest-dedup.xml
+          mv /tmp/manifest-dedup.xml "$MANIFEST"
+          awk '!seen[$0]++ || $0 !~ /android.intent.action.QUICKBOOT_POWERON/ { print }' "$MANIFEST" > /tmp/manifest-dedup.xml
+          mv /tmp/manifest-dedup.xml "$MANIFEST"
+          echo "✅ Duplicate INTERNET and QUICKBOOT declarations removed"
+
+      - name: Build Debug APK
+        id: build
+        working-directory: ./extracted/android
+        continue-on-error: true
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build-full.log
+          echo "=== Build exit code: ${PIPESTATUS[0]} ==="
+          exit ${PIPESTATUS[0]}
+
+      - name: Show Build Errors
+        if: steps.build.outcome == 'failure'
+        working-directory: ./extracted/android
+        run: |
+          echo "════════════════════════════════════════"
+          echo "🔴 Kotlin Errors:"
+          echo "════════════════════════════════════════"
+          grep -nE "^e: |Unresolved reference|error:" build-full.log | head -50 || echo "No Kotlin errors"
           echo ""
-          echo "APK found:"
-          echo "$APK_PATH"
+          echo "════════════════════════════════════════"
+          echo "🔴 What went wrong:"
+          echo "════════════════════════════════════════"
+          grep -A 10 "What went wrong" build-full.log || echo "No 'What went wrong'"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "🔴 آخر 80 سطر:"
+          echo "════════════════════════════════════════"
+          tail -80 build-full.log
 
-          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
-
-
-      # ==============================
-      # 11. Upload APK
-      # ==============================
-      - name: Upload APK artifact
+      - name: Upload Build Log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: ${{ steps.apk.outputs.apk_path }}
-          if-no-files-found: error
+          name: build-log
+          path: extracted/android/build-full.log
+          retention-days: 7
 
-
-      # ==============================
-      # 12. Build summary
-      # ==============================
-      - name: Build summary
-        if: always()
-        shell: bash
-        run: |
-          if [ -n "${{ steps.apk.outputs.apk_path }}" ] &&
-             [ -f "${{ steps.apk.outputs.apk_path }}" ]; then
-
-            echo "## ✅ APK Build Successful" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "APK successfully built." >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "**APK:** \`${{ steps.apk.outputs.apk_path }}\`" >> "$GITHUB_STEP_SUMMARY"
-
-          else
-
-            echo "## ❌ APK Build Failed" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "The APK was not generated." >> "$GITHUB_STEP_SUMMARY"
-
-          fi
+      - name: Upload APK
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: koufant-apk
+          path: extracted/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
