@@ -1,12 +1,5 @@
 name: Build Android APK
 
-# ═══════════════════════════════════════════════════════════════════
-# النسخة المعدّلة (v2): لا تعيد كتابة أي ملف Java من الصفر.
-#  - تأخذ ملفات android/…/com/kova/cash من الـ ZIP (بما فيها إصلاحات SMS) وتعيدها فوق مشروع cap add الجديد.
-#  - تنسخ TuaSmsSettingsPlugin.kt وتسجّله في MainActivity قبل super.onCreate().
-#  - لا تلمس MainActivity القادم من الـ ZIP إلا بإضافة ما ينقصه (تسجيل المكوّنات، وجسر الأدمن إن كان غائباً).
-# ═══════════════════════════════════════════════════════════════════
-
 on:
   push:
     branches: [ main ]
@@ -24,7 +17,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # التاريخ الكامل مطلوب لمعرفة أحدث ملف ZIP حسب وقت الـ commit
           fetch-depth: 0
 
       - name: Find and Unzip Project
@@ -34,7 +26,6 @@ jobs:
           echo "=== البحث عن ملفات ZIP ==="
           ls -la *.zip 2>/dev/null || echo "لا توجد ملفات ZIP في الجذر"
 
-          # يختار الملف الأحدث حسب وقت آخر commit (وليس حسب رقم V في الاسم)
           pick_latest() {
             local best="" best_ts=-1 f ts
             while IFS= read -r f; do
@@ -65,7 +56,6 @@ jobs:
           fi
           echo "✅ تم اختيار: $ZIP_FILE"
 
-          # كود الخروج 1 في unzip يعني تحذيراً فقط (مثل ترميز أسماء الملفات)
           unzip -q "$ZIP_FILE" -d extracted || {
             rc=$?
             if [ "$rc" -le 1 ]; then
@@ -119,7 +109,6 @@ jobs:
           
           if [ ! -d "extracted/native-plugins/android" ]; then
             echo "❌ مجلد native-plugins/android مفقود!"
-            ls -la extracted/
             exit 1
           fi
           echo "✅ native-plugins/android موجود"
@@ -136,7 +125,6 @@ jobs:
           fi
           echo "✅ capacitor.config.json موجود"
 
-          # ===== التحقق من أن الـ ZIP يحمل إصلاحات SMS (وليس نسخة قديمة) =====
           J="extracted/android/app/src/main/java/com/kova/cash"
           for f in SMSForegroundService.java SMSWorker.java SmsGatewaySettings.java MainActivity.kt; do
             if [ ! -f "$J/$f" ]; then
@@ -197,7 +185,9 @@ jobs:
             '@capacitor-firebase/messaging': '^6.0.0',
             '@capacitor/local-notifications': '^6.0.0',
             '@capacitor/geolocation': '^6.0.0',
-            '@capawesome-team/capacitor-android-battery-optimization': '^8.0.0'
+            '@capawesome-team/capacitor-android-battery-optimization': '^8.0.0',
+            'capacitor-sms-inbox': '^1.2.0',
+            'capacitor-sms-watcher-fork': '^1.0.5'
           };
           fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
           console.log('✅ package.json محدّث');
@@ -269,7 +259,6 @@ jobs:
             echo "❌ www/index.html لا يحتوي سطر <script src=\"js/sms-settings-bridge.js\"></script>"
             exit 1
           fi
-          # يجب أن يأتي الجسر بعد sms-logic.js
           L1=$(grep -n 'js/sms-logic.js' www/index.html | head -1 | cut -d: -f1)
           L2=$(grep -n 'js/sms-settings-bridge.js' www/index.html | head -1 | cut -d: -f1)
           if [ -z "$L1" ] || [ "$L2" -le "$L1" ]; then
@@ -282,10 +271,6 @@ jobs:
         working-directory: ./extracted
         run: npm install --legacy-peer-deps --force
 
-      # ═══════════════════════════════════════════════════════════
-      # ⭐ جديد: احفظ ملفات Java/Kotlin المُصلَحة من الـ ZIP قبل أن يمسح
-      #    "rm -rf android" المجلد (cap add android يبني مجلداً جديداً)
-      # ═══════════════════════════════════════════════════════════
       - name: Stash SMS Overlay from ZIP
         run: |
           SRC="extracted/android/app/src/main/java/com/kova/cash"
@@ -403,16 +388,11 @@ jobs:
             cp -r extracted/native-plugins/android/res/values* extracted/android/app/src/main/res/
           fi
 
-      # ═══════════════════════════════════════════════════════════
-      # ⭐ جديد: أعد ملفات Java/Kotlin من الـ ZIP فوق مشروع cap الجديد
-      #    (بدل خطوتي "Add SMS Gateway Files" و"Create MainActivity" المحذوفتين)
-      # ═══════════════════════════════════════════════════════════
       - name: Restore SMS Overlay (Java + MainActivity from ZIP)
         run: |
           DEST="extracted/android/app/src/main/java/com/kova/cash"
           mkdir -p "$DEST"
 
-          # حذف MainActivity الافتراضي الذي أنشأه cap add (وليس ملفك) كي لا يتكرر التعريف
           if [ -f /tmp/kova-overlay/MainActivity.kt ]; then
             rm -f "$DEST/MainActivity.java"
           fi
@@ -425,7 +405,6 @@ jobs:
           echo "=== ملفات الحزمة بعد الاستعادة ==="
           ls -la "$DEST"
 
-          # تأكد أن الإصلاحات وصلت فعلاً
           for f in SMSForegroundService.java SMSWorker.java; do
             if ! grep -q "SmsGatewaySettings" "$DEST/$f"; then
               echo "❌ $f بعد النسخ لا يحتوي إصلاحات SMS"
@@ -457,12 +436,6 @@ jobs:
 
           test -f "$PLUGINS_DIR/TuaSmsSettingsPlugin.kt" || { echo "❌ TuaSmsSettingsPlugin.kt لم يُنسخ"; exit 1; }
 
-      # ═══════════════════════════════════════════════════════════
-      # ⭐ جديد: يحافظ على MainActivity القادم من الـ ZIP، ويضيف فقط ما ينقصه:
-      #   1) import + registerPlugin لكل مكوّن محلي (ومنها TuaSmsSettingsPlugin) قبل super.onCreate()
-      #   2) جسر الأدمن KovantAdminBridge إن لم يكن موجوداً (js/auth.js يستدعيه)
-      #   التعديل idempotent: لا يكرّر شيئاً موجوداً أصلاً.
-      # ═══════════════════════════════════════════════════════════
       - name: Prepare MainActivity (register plugins, keep ZIP version)
         run: |
           python3 - <<'PY'
@@ -481,7 +454,6 @@ jobs:
 
           text = main.read_text(encoding='utf-8')
 
-          # ---- 1) اكتشاف كل المكوّنات المحلية (@CapacitorPlugin) ----
           classes = []
           for f in sorted(plugins_dir.glob('*.kt')):
               src = f.read_text(encoding='utf-8')
@@ -512,7 +484,6 @@ jobs:
                   fail('لا يوجد سطر package في MainActivity.kt')
               return t[:m.end()] + '\n\n' + block + t[m.end():]
 
-          # ---- تسجيل المكوّنات قبل super.onCreate ----
           text = add_imports(text, ['com.kova.cash.plugins.' + c for c in classes])
           sup = SUPER_RE.search(text)
           indent = sup.group(1)
@@ -526,7 +497,6 @@ jobs:
           else:
               print('كل المكوّنات مسجّلة أصلاً')
 
-          # ---- 2) جسر الأدمن إن كان غائباً ----
           if 'KovantAdminBridge' in text:
               print('✅ KovantAdminBridge موجود في MainActivity — لا حاجة للحقن')
           else:
@@ -550,7 +520,6 @@ jobs:
               text = text[:sup.end()] + '\n' + calls + text[sup.end():]
 
               members = '''
-              // ===== CI: جسر الأدمن (حُقن لأن MainActivity في الـ ZIP لا يحتويه) =====
               private val KV_REQ_NOTIF = 7401
               private val KV_REQ_SMS = 7402
 
@@ -641,7 +610,6 @@ jobs:
                   }
               }
               '''
-              # إزالة مسافات YAML الزائدة من كتلة الأعضاء ثم إضافتها بمسافة صف واحدة
               lines = members.split('\n')
               strip = min(len(l) - len(l.lstrip()) for l in lines if l.strip())
               members = '\n'.join(l[strip:] if l.strip() else '' for l in lines)
@@ -653,15 +621,12 @@ jobs:
 
           main.write_text(text, encoding='utf-8')
 
-          # ---- التحقق النهائي: التسجيل يسبق super.onCreate ----
           final = main.read_text(encoding='utf-8')
           i_reg = final.find('registerPlugin(TuaSmsSettingsPlugin::class.java)')
           i_sup = SUPER_RE.search(final).start()
           if i_reg == -1 or i_reg > i_sup:
               fail('registerPlugin(TuaSmsSettingsPlugin::class.java) غير موجود قبل super.onCreate')
           print('✅ registerPlugin(TuaSmsSettingsPlugin::class.java) موجود قبل super.onCreate')
-          print('================ MainActivity.kt النهائي ================')
-          print(final)
           PY
 
       - name: Add Permissions and Services
@@ -786,7 +751,6 @@ jobs:
           grep -q "BootReceiver" "$MANIFEST" && echo "✅ Receiver OK"
           grep -q "android.permission.INTERNET" "$MANIFEST" && echo "✅ INTERNET OK"
           grep -q "android.permission.CAMERA" "$MANIFEST" && echo "✅ CAMERA OK"
-
 
       - name: Register Connectivity Receiver
         run: |
