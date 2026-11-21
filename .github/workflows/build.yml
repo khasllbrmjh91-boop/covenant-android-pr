@@ -388,6 +388,34 @@ jobs:
             cp -r extracted/native-plugins/android/res/values* extracted/android/app/src/main/res/
           fi
 
+      - name: Apply App Icon (Kovant logo)
+        run: |
+          SRC="extracted/native-plugins/android/res"
+          DEST="extracted/android/app/src/main/res"
+
+          if [ ! -d "$SRC/mipmap-xxxhdpi" ] || [ ! -f "$SRC/mipmap-anydpi-v26/ic_launcher.xml" ]; then
+            echo "❌ أيقونات التطبيق غير موجودة في native-plugins/android/res — ارفع KOVANT-v42.zip (أو أحدث)"
+            exit 1
+          fi
+
+          # حذف أيقونات Capacitor الافتراضية (png/webp/xml) لتجنب التعارض وبقاء القديمة
+          for d in "$DEST"/mipmap-*; do
+            rm -f "$d"/ic_launcher*
+          done
+
+          for d in "$SRC"/mipmap-*; do
+            name=$(basename "$d")
+            mkdir -p "$DEST/$name"
+            cp -v "$d"/* "$DEST/$name"/
+          done
+
+          # أيقونة Capacitor الافتراضية قد تكون معرّفة أيضاً كـ drawable (vector) — لا تتعارض مع mipmap لكن نتأكد
+          echo "=== الأيقونات بعد التطبيق ==="
+          ls -la "$DEST"/mipmap-hdpi "$DEST"/mipmap-anydpi-v26
+          grep -q 'ic_launcher_bg' "$DEST/mipmap-anydpi-v26/ic_launcher.xml" || { echo "❌ ic_launcher.xml لم يُستبدل"; exit 1; }
+          grep -q 'android:icon="@mipmap/ic_launcher"' extracted/android/app/src/main/AndroidManifest.xml || echo "⚠️ AndroidManifest لا يشير إلى @mipmap/ic_launcher"
+          echo "✅ تم تطبيق أيقونة كوفانت"
+
       - name: Restore SMS Overlay (Java + MainActivity from ZIP)
         run: |
           DEST="extracted/android/app/src/main/java/com/kova/cash"
