@@ -217,7 +217,7 @@ jobs:
             CovaTrafficStats: { enabled: true },
             TuaNotification: { enabled: true },
             CapacitorHttp: { enabled: true },
-            LocalNotifications: { enabled: true },
+            LocalNotifications: { enabled: true, smallIcon: 'ic_stat_kovant', iconColor: '#1A6FA8' },
             Geolocation: { enabled: true },
             AppLauncher: { enabled: true },
             FirebaseMessaging: { enabled: true },
@@ -387,6 +387,16 @@ jobs:
           if ls extracted/native-plugins/android/res/values* 1> /dev/null 2>&1; then
             cp -r extracted/native-plugins/android/res/values* extracted/android/app/src/main/res/
           fi
+
+          # أيقونة الإشعارات الصغيرة (بيضاء شفافة) — بدونها تظهر الإشعارات بأيقونة بيضاء افتراضية
+          if [ -f extracted/native-plugins/android/res/drawable/ic_stat_kovant.xml ]; then
+            cp extracted/native-plugins/android/res/drawable/ic_stat_kovant.xml extracted/android/app/src/main/res/drawable/ic_stat_kovant.xml
+          else
+            echo "❌ ic_stat_kovant.xml مفقود في native-plugins/android/res/drawable"
+            exit 1
+          fi
+          test -f extracted/android/app/src/main/res/values/kovant_colors.xml || { echo "❌ kovant_colors.xml لم يُنسخ"; exit 1; }
+          echo "✅ أيقونة ولون الإشعارات منسوخان"
 
       - name: Apply App Icon (Kovant logo)
         run: |
@@ -734,6 +744,30 @@ jobs:
             mv /tmp/m4.xml "$MANIFEST"
             echo "✅ SpeedOverlayService added"
           fi
+
+      - name: FCM Notification Icon, Color and Channel
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+          mf = pathlib.Path('extracted/android/app/src/main/AndroidManifest.xml')
+          if not mf.is_file():
+              print('❌ AndroidManifest.xml NOT FOUND'); sys.exit(1)
+          t = mf.read_text(encoding='utf-8')
+          if 'default_notification_icon' in t:
+              print('✓ meta-data موجودة مسبقاً')
+          else:
+              meta = (
+                  '\n        <meta-data android:name="com.google.firebase.messaging.default_notification_icon" android:resource="@drawable/ic_stat_kovant" />'
+                  '\n        <meta-data android:name="com.google.firebase.messaging.default_notification_color" android:resource="@color/kovant_notification_color" />'
+                  '\n        <meta-data android:name="com.google.firebase.messaging.default_notification_channel_id" android:value="kovant_default" />\n'
+              )
+              t, n = re.subn(r'(<application\b[^>]*>)', lambda m: m.group(1) + meta, t, count=1)
+              if n != 1:
+                  print('❌ لم أجد وسم <application>'); sys.exit(1)
+              mf.write_text(t, encoding='utf-8')
+              print('✅ أُضيفت meta-data لأيقونة/لون/قناة FCM')
+          PY
+          grep -q "default_notification_icon" extracted/android/app/src/main/AndroidManifest.xml || { echo "❌ meta-data لم تُضف"; exit 1; }
 
       - name: Register SMS Gateway in Manifest
         run: |
